@@ -203,18 +203,30 @@ resolve_image() {
 require_image() {
     local img="$1"
     if ! docker image inspect "$img" >/dev/null 2>&1; then
-        echo "❌ Docker image '${img}' does not exist. Build it first:"
+        echo "❌ Docker image '${img}' does not exist."
         local base_hint=""
         if [[ -f "$REGISTRY_FILE" ]]; then
             local tag="${img#*:}"
             base_hint=$(jq -r --arg t "$tag" '.images[] | select(.tag == $t) | .base_image // empty' "$REGISTRY_FILE" 2>/dev/null)
         fi
+        echo ""
+        echo "Build it first:"
         if [[ -n "$base_hint" && "$base_hint" != "$DEFAULT_BASE_IMAGE" ]]; then
             echo "   $(basename "$0") build $base_hint"
         elif [[ "$img" != "$(image_tag "default")" ]]; then
             echo "   $(basename "$0") build <base-image>"
         else
             echo "   $(basename "$0") build"
+        fi
+        if [[ -f "$REGISTRY_FILE" ]]; then
+            local count
+            count=$(jq '[.images[] | select(.tag != "'"${img#*:}"'")] | length' "$REGISTRY_FILE" 2>/dev/null || echo 0)
+            if [[ "$count" -gt 0 ]]; then
+                echo ""
+                echo "Or select an existing image:"
+                echo "   $(basename "$0") list"
+                echo "   $(basename "$0") select <number>"
+            fi
         fi
         exit 1
     fi

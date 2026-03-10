@@ -176,15 +176,17 @@ function Assert-ImageExists {
     param([string]$Image)
     & { $ErrorActionPreference = 'Continue'; docker image inspect $Image *>$null }
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[ERROR] Docker image '${Image}' does not exist. Build it first:"
+        Write-Host "[ERROR] Docker image '${Image}' does not exist."
         $baseHint = ''
+        $currentTag = $Image.Split(':')[-1]
         if (Test-Path $RegistryFile) {
-            $tag = $Image.Split(':')[-1]
             $reg = Read-Registry
-            $entry = $reg.images | Where-Object { $_.tag -eq $tag }
+            $entry = $reg.images | Where-Object { $_.tag -eq $currentTag }
             if ($entry) { $baseHint = $entry.base_image }
         }
         $defaultTag = Get-ImageTag -Slug 'default'
+        Write-Host ""
+        Write-Host "Build it first:"
         if ($baseHint -and $baseHint -ne $DefaultBaseImage) {
             Write-Host "   .\claude-yolo.ps1 build $baseHint"
         }
@@ -193,6 +195,15 @@ function Assert-ImageExists {
         }
         else {
             Write-Host "   .\claude-yolo.ps1 build"
+        }
+        if (Test-Path $RegistryFile) {
+            $otherCount = @($reg.images | Where-Object { $_.tag -ne $currentTag }).Count
+            if ($otherCount -gt 0) {
+                Write-Host ""
+                Write-Host "Or select an existing image:"
+                Write-Host "   .\claude-yolo.ps1 list"
+                Write-Host "   .\claude-yolo.ps1 select <number>"
+            }
         }
         exit 1
     }
