@@ -30,6 +30,7 @@ $ProjectDir = Join-Path (Get-Location).Path '.claude-cache'
 $RegistryDir = Join-Path $env:USERPROFILE '.claude-yolo'
 $RegistryFile = Join-Path $RegistryDir 'registry.json'
 $ProjectConfig = Join-Path $ProjectDir 'config.json'
+$HostCredentials = Join-Path (Join-Path $env:USERPROFILE '.claude') '.credentials.json'
 
 $DefaultBaseImage = 'ubuntu:24.04'
 
@@ -67,14 +68,14 @@ EXAMPLES:
 
 function Test-Docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Write-Host "❌ 'docker' is not installed."
+        Write-Host "[ERROR] 'docker' is not installed."
         Write-Host "   Install Docker Desktop: https://docs.docker.com/desktop/setup/install/windows-install/"
         exit 1
     }
 
-    $result = docker info 2>&1
+    & { $ErrorActionPreference = 'Continue'; docker info *>$null }
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "❌ Docker is installed but not reachable."
+        Write-Host "[ERROR] Docker is installed but not reachable."
         Write-Host ""
         Write-Host "   Docker Desktop is probably not running."
         Write-Host "   Start Docker Desktop from the Start menu or system tray."
@@ -106,7 +107,9 @@ function Initialize-Registry {
 }
 
 function Read-Registry {
-    return Get-Content $RegistryFile -Raw | ConvertFrom-Json
+    $reg = Get-Content $RegistryFile -Raw | ConvertFrom-Json
+    $reg.images = @($reg.images)
+    return $reg
 }
 
 $RegistryLock = Join-Path $RegistryDir '.registry.lock'
@@ -115,22 +118,27 @@ $LockInterval = 1
 
 function Lock-Registry {
     $waited = 0
-    while (Test-Path $RegistryLock) {
-        if ($waited -ge $LockTimeout) {
-            Write-Host "❌ Registry is locked by another process (timeout after ${LockTimeout}s)."
-            Write-Host "   Lock file: $RegistryLock"
-            Write-Host "   If no other instance is running, remove it manually:"
-            Write-Host "   Remove-Item '$RegistryLock'"
-            exit 1
+    while ($true) {
+        try {
+            New-Item -ItemType Directory -Path $RegistryLock -ErrorAction Stop | Out-Null
+            return
         }
-        Start-Sleep -Seconds $LockInterval
-        $waited += $LockInterval
+        catch {
+            if ($waited -ge $LockTimeout) {
+                Write-Host "[ERROR] Registry is locked by another process (timeout after ${LockTimeout}s)."
+                Write-Host "   Lock dir: $RegistryLock"
+                Write-Host "   If no other instance is running, remove it manually:"
+                Write-Host "   Remove-Item '$RegistryLock'"
+                exit 1
+            }
+            Start-Sleep -Seconds $LockInterval
+            $waited += $LockInterval
+        }
     }
-    New-Item -ItemType File -Path $RegistryLock -Force | Out-Null
 }
 
 function Unlock-Registry {
-    Remove-Item $RegistryLock -Force -ErrorAction SilentlyContinue
+    Remove-Item $RegistryLock -Force -Recurse -ErrorAction SilentlyContinue
 }
 
 function Add-RegistryEntry {
@@ -166,9 +174,9 @@ function Resolve-Image {
 
 function Assert-ImageExists {
     param([string]$Image)
-    $inspectResult = docker image inspect $Image 2>&1
+    & { $ErrorActionPreference = 'Continue'; docker image inspect $Image *>$null }
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "❌ Docker image '${Image}' does not exist. Build it first:"
+        Write-Host "[ERROR] Docker image '${Image}' does not exist. Build it first:"
         $baseHint = ''
         if (Test-Path $RegistryFile) {
             $tag = $Image.Split(':')[-1]
@@ -211,8 +219,10 @@ function Import-EnvFile {
     $envFile = Join-Path $ScriptDir '.env'
     if (Test-Path $envFile) {
         Get-Content $envFile | ForEach-Object {
-            if ($_ -match '^\s*([^#][^=]+)=(.*)$') {
-                [Environment]::SetEnvironmentVariable($Matches[1].Trim(), $Matches[2].Trim(), 'Process')
+            if ($_ -match '^\s*([^#=][^=]*)=(.*)$') {
+                $key = $Matches[1].Trim()
+                $val = $Matches[2].Trim() -replace '^["'']|["'']$', ''
+                [Environment]::SetEnvironmentVariable($key, $val, 'Process')
             }
         }
     }
@@ -221,6 +231,8 @@ function Import-EnvFile {
 function Test-Auth {
     if ($env:ANTHROPIC_API_KEY) { return }
 
+    if (Test-Path $HostCredentials) { return }
+
     $tokenFile = Join-Path $GlobalDir '.claude-oauth-token'
     if (Test-Path $tokenFile) {
         $env:CLAUDE_CODE_OAUTH_TOKEN = (Get-Content $tokenFile -Raw).Trim()
@@ -228,30 +240,30 @@ function Test-Auth {
     }
 
     if ($Silent) {
-        Write-Host "❌ -Silent requires authentication"
-        Write-Host "   Set ANTHROPIC_API_KEY in $ScriptDir\.env or run: .\claude-yolo.ps1 login"
+        Write-Host "[ERROR] -Silent requires authentication"
+        Write-Host "   Set ANTHROPIC_API_KEY in $ScriptDir\.env or run: claude login"
         exit 1
     }
 
-    Write-Host "❌ No authentication found."
-    Write-Host "   Run '.\claude-yolo.ps1 login' first to set up OAuth token."
+    Write-Host "[ERROR] No authentication found."
+    Write-Host "   Run 'claude login' on the host first, or set ANTHROPIC_API_KEY."
     exit 1
 }
 
 function Invoke-Login {
     if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-        Write-Host "❌ 'claude' CLI not found on this machine."
-        Write-Host "   Install it first: npm install -g @anthropic-ai/claude-code"
+        Write-Host "[ERROR] 'claude' CLI not found on this machine."
+        Write-Host "   Install it first: https://docs.anthropic.com/en/docs/claude-code/setup"
         exit 1
     }
 
     if (-not (Test-Path $GlobalDir)) { New-Item -ItemType Directory -Path $GlobalDir -Force | Out-Null }
-    Write-Host "🔑 Starting OAuth login via local Claude CLI..."
+    Write-Host "[*] Starting OAuth login via local Claude CLI..."
     Write-Host ""
 
     $tmpFile = [System.IO.Path]::GetTempFileName()
     try {
-        claude setup-token | Tee-Object -FilePath $tmpFile
+        & { $ErrorActionPreference = 'Continue'; claude setup-token } | Tee-Object -FilePath $tmpFile
         $output = Get-Content $tmpFile -Raw
         if ($output -match '(sk-ant-[A-Za-z0-9_-]+)') {
             $token = $Matches[1]
@@ -262,7 +274,7 @@ function Invoke-Login {
     }
 
     if (-not $token) {
-        Write-Host "❌ Failed to capture token from output."
+        Write-Host "[ERROR] Failed to capture token from output."
         $tokenFile = Join-Path $GlobalDir '.claude-oauth-token'
         Write-Host "   Run 'claude setup-token' manually and save the token to: $tokenFile"
         exit 1
@@ -271,16 +283,16 @@ function Invoke-Login {
     $tokenFile = Join-Path $GlobalDir '.claude-oauth-token'
     Set-Content -Path $tokenFile -Value $token -NoNewline
     Write-Host ""
-    Write-Host "✅ Token saved to $tokenFile"
+    Write-Host "[OK] Token saved to $tokenFile"
 }
 
 function Invoke-Build {
-    param([string[]]$Args)
+    param([string[]]$Params)
 
     $baseImage = ''
     $force = $false
 
-    foreach ($arg in $Args) {
+    foreach ($arg in $Params) {
         if ($arg -eq '--force') { $force = $true }
         else { $baseImage = $arg }
     }
@@ -293,29 +305,33 @@ function Invoke-Build {
     if ($baseImage) {
         $buildArgs += '--build-arg', "BASE_IMAGE=$baseImage"
     }
-    Write-Host "🔨 Building ${fullTag} (base: ${actualBase})..."
+    Write-Host "[*] Building ${fullTag} (base: ${actualBase})..."
     if ($force) {
         $buildArgs += '--no-cache'
         Write-Host "   (no-cache)"
     }
-    docker build @buildArgs -t $fullTag $ScriptDir
+    & { $ErrorActionPreference = 'Continue'; docker build @buildArgs -t $fullTag $ScriptDir }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ERROR] Docker build failed."
+        exit 1
+    }
     Initialize-Registry
     Add-RegistryEntry -Slug $slug -BaseImage $actualBase
-    Write-Host "✅ Image built and registered: ${fullTag}"
+    Write-Host "[OK] Image built and registered: ${fullTag}"
 }
 
 function Show-ImageList {
     Initialize-Registry
     $reg = Read-Registry
 
-    if ($reg.images.Count -eq 0) {
+    if (@($reg.images).Count -eq 0) {
         Write-Host "No images built yet. Run '.\claude-yolo.ps1 build' first."
         return
     }
 
     $stale = @()
     foreach ($img in $reg.images) {
-        $inspectResult = docker image inspect $img.full_tag 2>&1
+        & { $ErrorActionPreference = 'Continue'; docker image inspect $img.full_tag *>$null }
         if ($LASTEXITCODE -ne 0) {
             $stale += $img.tag
         }
@@ -327,14 +343,14 @@ function Show-ImageList {
             $reg = Read-Registry
             foreach ($t in $stale) {
                 $reg.images = @($reg.images | Where-Object { $_.tag -ne $t })
-                Write-Host "  🗑  Removed stale entry: $t (Docker image no longer exists)"
+                Write-Host "  [DEL]  Removed stale entry: $t (Docker image no longer exists)"
             }
             $reg | ConvertTo-Json -Depth 10 | Set-Content $RegistryFile
         }
         finally {
             Unlock-Registry
         }
-        if ($reg.images.Count -eq 0) {
+        if (@($reg.images).Count -eq 0) {
             Write-Host ""
             Write-Host "No images left. Run '.\claude-yolo.ps1 build' first."
             return
@@ -357,9 +373,9 @@ function Show-ImageList {
 
     $fmt = "  {0,-2}{1,-4}  {2,-$maxTag}  {3,-$maxBase}  {4}"
     Write-Host ($fmt -f ' ', '#', 'TAG', 'BASE IMAGE', 'BUILT')
-    Write-Host ($fmt -f ' ', '---', ('─' * $maxTag), ('─' * $maxBase), ('─' * 19))
+    Write-Host ($fmt -f ' ', '---', ('-' * $maxTag), ('-' * $maxBase), ('-' * 19))
 
-    for ($i = 0; $i -lt $reg.images.Count; $i++) {
+    for ($i = 0; $i -lt @($reg.images).Count; $i++) {
         $img = $reg.images[$i]
         $built = $img.built_at -replace 'T', ' ' -replace 'Z', ''
         $prefix = if ($img.full_tag -eq $current) { '*' } else { ' ' }
@@ -392,8 +408,8 @@ function Select-Image {
 
     if ($Selector -match '^\d+$') {
         $idx = [int]$Selector - 1
-        if ($idx -lt 0 -or $idx -ge $reg.images.Count) {
-            Write-Host "❌ Invalid number: $Selector (have $($reg.images.Count) images)"
+        if ($idx -lt 0 -or $idx -ge @($reg.images).Count) {
+            Write-Host "[ERROR] Invalid number: $Selector (have $(@($reg.images).Count) images)"
             exit 1
         }
         $fullTag = $reg.images[$idx].full_tag
@@ -403,7 +419,7 @@ function Select-Image {
     else {
         $match = $reg.images | Where-Object { $_.tag -eq $Selector }
         if (-not $match) {
-            Write-Host "❌ No image with tag '$Selector' found."
+            Write-Host "[ERROR] No image with tag '$Selector' found."
             Write-Host "   Run '.\claude-yolo.ps1 list' to see available images."
             exit 1
         }
@@ -415,7 +431,7 @@ function Select-Image {
     Assert-ImageExists -Image $fullTag
 
     Set-ProjectImage -FullTag $fullTag
-    Write-Host "✅ Project now uses: ${fullTag} (base: ${baseImage})"
+    Write-Host "[OK] Project now uses: ${fullTag} (base: ${baseImage})"
 }
 
 function Remove-Image {
@@ -434,8 +450,8 @@ function Remove-Image {
 
     if ($Selector -match '^\d+$') {
         $idx = [int]$Selector - 1
-        if ($idx -lt 0 -or $idx -ge $reg.images.Count) {
-            Write-Host "❌ Invalid number: $Selector (have $($reg.images.Count) images)"
+        if ($idx -lt 0 -or $idx -ge @($reg.images).Count) {
+            Write-Host "[ERROR] Invalid number: $Selector (have $(@($reg.images).Count) images)"
             exit 1
         }
         $fullTag = $reg.images[$idx].full_tag
@@ -444,7 +460,7 @@ function Remove-Image {
     else {
         $match = $reg.images | Where-Object { $_.tag -eq $Selector }
         if (-not $match) {
-            Write-Host "❌ No image with tag '$Selector' found."
+            Write-Host "[ERROR] No image with tag '$Selector' found."
             Write-Host "   Run '.\claude-yolo.ps1 list' to see available images."
             exit 1
         }
@@ -461,14 +477,14 @@ function Remove-Image {
     finally {
         Unlock-Registry
     }
-    Write-Host "✅ Removed '${tag}' from registry"
+    Write-Host "[OK] Removed '${tag}' from registry"
 
-    $inspectResult = docker image inspect $fullTag 2>&1
+    & { $ErrorActionPreference = 'Continue'; docker image inspect $fullTag *>$null }
     if ($LASTEXITCODE -eq 0) {
         $answer = Read-Host "   Docker image ${fullTag} exists. Remove it too? [y/N]"
         if ($answer -match '^[Yy]$') {
-            docker rmi $fullTag
-            Write-Host "✅ Docker image removed"
+            & { $ErrorActionPreference = 'Continue'; docker rmi $fullTag }
+            Write-Host "[OK] Docker image removed"
         }
     }
 }
@@ -480,9 +496,9 @@ function Show-Status {
     $running = docker ps --format '{{.Names}}' | Where-Object { $_ -eq $name }
 
     if ($running) {
-        $started = docker inspect --format '{{.State.StartedAt}}' $name 2>$null
+        $started = & { $ErrorActionPreference = 'Continue'; docker inspect --format '{{.State.StartedAt}}' $name 2>$null }
         if ($started) { $started = $started.Substring(0, 19).Replace('T', ' ') }
-        Write-Host "✅ Container is running"
+        Write-Host "[OK] Container is running"
         Write-Host "   Directory: $dir"
         Write-Host "   Name:      $name"
         Write-Host "   Image:     $img"
@@ -491,14 +507,14 @@ function Show-Status {
     else {
         $exists = docker ps -a --format '{{.Names}}' | Where-Object { $_ -eq $name }
         if ($exists) {
-            $status = docker inspect --format '{{.State.Status}}' $name 2>$null
-            Write-Host "⚠️  Container exists but is not running (status: $status)"
+            $status = & { $ErrorActionPreference = 'Continue'; docker inspect --format '{{.State.Status}}' $name 2>$null }
+            Write-Host "[WARN]  Container exists but is not running (status: $status)"
             Write-Host "   Directory: $dir"
             Write-Host "   Name:      $name"
             Write-Host "   Image:     $img"
         }
         else {
-            Write-Host "💤 No container for this directory"
+            Write-Host "[--] No container for this directory"
             Write-Host "   Directory: $dir"
             Write-Host "   Image:     $img"
         }
@@ -509,12 +525,12 @@ function Show-Logs {
     $name = Get-ContainerName
     $running = docker ps --format '{{.Names}}' | Where-Object { $_ -eq $name }
     if (-not $running) {
-        Write-Host "❌ No container is running for this directory"
+        Write-Host "[ERROR] No container is running for this directory"
         Show-Status
         exit 1
     }
-    Write-Host "📋 Logs for container ${name} (Ctrl+C to quit):"
-    docker logs -f $name
+    Write-Host "[*] Logs for container ${name} (Ctrl+C to quit):"
+    & { $ErrorActionPreference = 'Continue'; docker logs -f $name }
 }
 
 function Stop-Container {
@@ -522,19 +538,19 @@ function Stop-Container {
     $running = docker ps --format '{{.Names}}' | Where-Object { $_ -eq $name }
 
     if ($running) {
-        Write-Host "🛑 Stopping container ${name}..."
-        docker stop $name
-        Write-Host "✅ Stopped"
+        Write-Host "[*] Stopping container ${name}..."
+        & { $ErrorActionPreference = 'Continue'; docker stop $name }
+        Write-Host "[OK] Stopped"
     }
     else {
         $exists = docker ps -a --format '{{.Names}}' | Where-Object { $_ -eq $name }
         if ($exists) {
-            Write-Host "🗑  Removing stopped container ${name}..."
-            docker rm $name
-            Write-Host "✅ Removed"
+            Write-Host "[DEL]  Removing stopped container ${name}..."
+            & { $ErrorActionPreference = 'Continue'; docker rm $name }
+            Write-Host "[OK] Removed"
         }
         else {
-            Write-Host "💤 No container for this directory"
+            Write-Host "[--] No container for this directory"
         }
     }
 }
@@ -546,14 +562,14 @@ function Invoke-Run {
     $running = docker ps --format '{{.Names}}' | Where-Object { $_ -eq $name }
 
     if ($running) {
-        Write-Host "⚠️  A container is already running for this directory: ${name}"
+        Write-Host "[WARN]  A container is already running for this directory: ${name}"
         Write-Host "   Use '.\claude-yolo.ps1 status' or '.\claude-yolo.ps1 stop'"
         exit 1
     }
 
     $exists = docker ps -a --format '{{.Names}}' | Where-Object { $_ -eq $name }
     if ($exists) {
-        docker rm $name | Out-Null
+        & { $ErrorActionPreference = 'Continue'; docker rm $name *>$null }
     }
 
     $img = Resolve-Image
@@ -582,25 +598,32 @@ function Invoke-Run {
     if ($env:ANTHROPIC_API_KEY) {
         $baseArgs += '-e', "ANTHROPIC_API_KEY=$($env:ANTHROPIC_API_KEY)"
     }
+    elseif (Test-Path $HostCredentials) {
+        $baseArgs += '-v', "${HostCredentials}:/root/.claude/.credentials.json:ro"
+    }
     elseif ($env:CLAUDE_CODE_OAUTH_TOKEN) {
         $baseArgs += '-e', "CLAUDE_CODE_OAUTH_TOKEN=$($env:CLAUDE_CODE_OAUTH_TOKEN)"
     }
 
     if ($Silent) {
-        Write-Host "🚀 Starting in the background..."
+        Write-Host "[*] Starting in the background..."
         Write-Host "   Directory: $dir"
         Write-Host "   Name:      ${name}"
         Write-Host "   Image:     ${img}"
         $allArgs = @('run', '-d') + $baseArgs + @($img) + $ClaudeArgs
-        docker @allArgs
+        & { $ErrorActionPreference = 'Continue'; docker @allArgs }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERROR] Failed to start container."
+            exit 1
+        }
         Write-Host ""
-        Write-Host "📋 Follow output: .\claude-yolo.ps1 logs"
-        Write-Host "🛑 Stop:          .\claude-yolo.ps1 stop"
-        Write-Host "📊 Status:        .\claude-yolo.ps1 status"
+        Write-Host "[*] Follow output: .\claude-yolo.ps1 logs"
+        Write-Host "[*] Stop:          .\claude-yolo.ps1 stop"
+        Write-Host "[*] Status:        .\claude-yolo.ps1 status"
     }
     else {
         $allArgs = @('run', '-it', '--rm') + $baseArgs + @($img) + $ClaudeArgs
-        docker @allArgs
+        & { $ErrorActionPreference = 'Continue'; docker @allArgs }
     }
 }
 
@@ -616,7 +639,7 @@ Test-Docker
 $claudeArgs = @()
 
 switch ($Command) {
-    'build'  { Initialize-Registry; Invoke-Build -Args $Rest; return }
+    'build'  { Initialize-Registry; Invoke-Build -Params $Rest; return }
     'list'   { Show-ImageList; return }
     'select' { Select-Image -Selector ($Rest | Select-Object -First 1); return }
     'remove' { Remove-Image -Selector ($Rest | Select-Object -First 1); return }
@@ -632,18 +655,23 @@ switch ($Command) {
             $knownCommands = @('build', 'list', 'select', 'remove', 'login', 'status', 'logs', 'stop')
             $best = $knownCommands | Where-Object { $_.StartsWith($Command) -or $Command.StartsWith($_) } | Select-Object -First 1
             if ($best) {
-                Write-Host "❌ Unknown command: $Command"
+                Write-Host "[ERROR] Unknown command: $Command"
                 Write-Host "   Did you mean: .\claude-yolo.ps1 $best"
             }
             else {
-                Write-Host "❌ Unknown command: $Command"
+                Write-Host "[ERROR] Unknown command: $Command"
                 Write-Host "   Run '.\claude-yolo.ps1 help' to see available commands."
             }
             exit 1
         }
         if ($Command -eq '--silent') { $Silent = $true }
+        $afterSeparator = $false
         foreach ($arg in $Rest) {
-            if ($arg -eq '--') { continue }
+            if ($afterSeparator) {
+                $claudeArgs += $arg
+                continue
+            }
+            if ($arg -eq '--') { $afterSeparator = $true; continue }
             if ($arg -eq '--silent') { $Silent = $true; continue }
             $claudeArgs += $arg
         }

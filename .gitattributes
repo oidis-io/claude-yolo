@@ -1,0 +1,7 @@
+# Force LF for files that end up inside Linux containers or are executed by sh/bash
+Dockerfile    text eol=lf
+*.sh          text eol=lf
+.dockerignore text eol=lf
+
+# PowerShell is Windows-native, CRLF is fine
+*.ps1         text eol=crlf
